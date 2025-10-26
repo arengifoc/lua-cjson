@@ -62,8 +62,21 @@ jobs:
           echo '%_topdir %(echo $HOME)/rpmbuild' > ~/.rpmmacros
           cp /usr/local/lib/lua/5.1/cjson.so ~/rpmbuild/SOURCES/
           
-          # Update spec file with detected version
-          sed "s/Version:.*/Version:        ${{ steps.version.outputs.version }}/" SPECS/lua-cjson.spec > ~/rpmbuild/SPECS/lua-cjson.spec
+          # Generate dynamic changelog entry
+          BUILD_DATE=$(date +'%a %b %d %Y')
+          PACKAGER="GitHub Actions <noreply@github.com>"
+          VERSION="${{ steps.version.outputs.version }}"
+          RELEASE="1%{?dist}"
+          UPSTREAM_TAG="${{ steps.version.outputs.tag }}"
+          
+          # Update spec file with detected version and dynamic changelog
+          sed -e "s/Version:.*/Version:        $VERSION/" \
+              -e "s/__DATE__/$BUILD_DATE/" \
+              -e "s/__PACKAGER__/$PACKAGER/" \
+              -e "s/__VERSION__/$VERSION/g" \
+              -e "s/__RELEASE__/$RELEASE/" \
+              -e "s/__UPSTREAM_TAG__/$UPSTREAM_TAG/" \
+              SPECS/lua-cjson.spec > ~/rpmbuild/SPECS/lua-cjson.spec
           
           echo "Generated spec file:"
           cat ~/rpmbuild/SPECS/lua-cjson.spec

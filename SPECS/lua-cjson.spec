@@ -19,4 +19,6 @@ install -m 0755 %{_sourcedir}/cjson.so %{buildroot}/usr/local/lib/lua/5.1
 /usr/local/lib/lua/5.1/cjson.so
 
 %changelog
-- Initial build of precompiled lua-cjson module
+* __DATE__ __PACKAGER__ - __VERSION__-__RELEASE__
+- Automated build of lua-cjson __VERSION__ from upstream source
+- Source: https://github.com/openresty/lua-cjson/releases/tag/__UPSTREAM_TAG__
