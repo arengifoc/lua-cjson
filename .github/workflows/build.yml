@@ -29,7 +29,11 @@ jobs:
           curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
           echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
           sudo apt update
-          sudo apt install gh -y
+          sudo apt install gh jq -y
+          
+          # Show gh version for debugging
+          echo "GitHub CLI version:"
+          gh --version
 
       - name: Check version and decide if build is needed
         id: version-check
@@ -65,8 +69,46 @@ jobs:
           
           # Try to list releases first
           echo "Testing gh release list..."
-          if gh release list --limit 5 2>&1; then
+          echo "All releases in repository (limit 10):"
+          if gh release list --limit 10 2>&1; then
             echo "✅ gh release list successful"
+            
+            # Try different gh release list options
+            echo ""
+            echo "Testing gh release list with --include-drafts:"
+            gh release list --limit 10 --include-drafts 2>&1 || echo "❌ --include-drafts failed"
+            
+            echo ""
+            echo "Testing gh release list ALL releases (no limit):"
+            ALL_RELEASES=$(gh release list --limit 100 2>&1)
+            echo "$ALL_RELEASES"
+            
+            # Check if our target release appears in the list
+            echo ""
+            echo "Searching for $RELEASE_TAG in release list..."
+            if echo "$ALL_RELEASES" | grep -q "$RELEASE_TAG"; then
+              echo "✅ $RELEASE_TAG found in full release list"
+            else
+              echo "❌ $RELEASE_TAG NOT found in ANY release list"
+              
+              # Try alternative tag formats
+              echo "Trying alternative tag formats:"
+              ALT_TAG1="${UPSTREAM_VERSION}"  # without 'v' prefix
+              ALT_TAG2="v${UPSTREAM_VERSION}" # with 'v' prefix (should be same as RELEASE_TAG)
+              
+              if echo "$ALL_RELEASES" | grep -q "$ALT_TAG1"; then
+                echo "✅ Found with format: $ALT_TAG1"
+              elif echo "$ALL_RELEASES" | grep -q "$ALT_TAG2"; then
+                echo "✅ Found with format: $ALT_TAG2"
+              else
+                echo "❌ Not found with any tag format variations"
+                echo "This suggests a more fundamental issue:"
+                echo "  1. Release was created outside of GitHub's normal flow"
+                echo "  2. gh CLI version compatibility issue"
+                echo "  3. Repository access/permission edge case"
+                echo "  4. GitHub API vs CLI data inconsistency"
+              fi
+            fi
           else
             echo "❌ gh release list failed"
           fi
@@ -85,6 +127,12 @@ jobs:
             # Method 2: Try GitHub API directly
             echo "Trying GitHub API..."
             echo "API URL: https://api.github.com/repos/${{ github.repository }}/releases/tags/$RELEASE_TAG"
+            
+            # Get full release information
+            API_RESPONSE=$(curl -s \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/tags/$RELEASE_TAG")
             HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: Bearer $GITHUB_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -93,6 +141,45 @@ jobs:
             echo "HTTP Status: $HTTP_STATUS"
             if [ "$HTTP_STATUS" = "200" ]; then
               echo "✅ Found release via GitHub API"
+              
+              # Extract release details
+              DRAFT=$(echo "$API_RESPONSE" | jq -r '.draft // false')
+              PRERELEASE=$(echo "$API_RESPONSE" | jq -r '.prerelease // false')
+              RELEASE_NAME=$(echo "$API_RESPONSE" | jq -r '.name // "N/A"')
+              CREATED_AT=$(echo "$API_RESPONSE" | jq -r '.created_at // "N/A"')
+              
+              echo "Release details:"
+              echo "  - Name: $RELEASE_NAME"
+              echo "  - Created: $CREATED_AT"
+              echo "  - Draft: $DRAFT"
+              echo "  - Prerelease: $PRERELEASE"
+              
+              if [ "$DRAFT" = "true" ]; then
+                echo "🔍 INSIGHT: Release is a DRAFT - this explains why gh CLI doesn't see it!"
+                echo "   Draft releases are not visible through normal gh release commands"
+              elif [ "$PRERELEASE" = "true" ]; then
+                echo "🔍 INSIGHT: Release is a PRERELEASE - gh CLI might filter these by default"
+              else
+                echo "🔍 INSIGHT: Release is public and published - gh CLI issue is likely:"
+                echo "  1. gh CLI version bug or compatibility issue"
+                echo "  2. Different API endpoints used by gh vs direct API"
+                echo "  3. Caching/timing issue in gh CLI"
+                echo "  4. gh CLI filtering logic excluding this release"
+                
+                echo ""
+                echo "🔍 COMPARING API vs gh CLI data:"
+                echo "API sees: Draft=$DRAFT, Prerelease=$PRERELEASE, Name='$RELEASE_NAME'"
+                
+                # Compare with what gh CLI sees
+                echo "gh CLI release count: $(gh release list --limit 100 | wc -l)"
+                echo "API release count via curl:"
+                API_COUNT=$(curl -s \
+                  -H "Authorization: Bearer $GITHUB_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/${{ github.repository }}/releases" | jq length)
+                echo "API sees $API_COUNT total releases"
+              fi
+              
               RELEASE_EXISTS="true"
               
               # Additional analysis
