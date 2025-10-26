@@ -46,7 +46,34 @@ jobs:
           echo "🔍 Checking if release v$UPSTREAM_VERSION already exists..."
           RELEASE_TAG="v$UPSTREAM_VERSION"
           
+          # Try multiple methods to check if release exists
+          RELEASE_EXISTS="false"
+          
+          # Method 1: Try gh release view
+          echo "Trying gh release view..."
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "✅ Found release via gh release view"
+            RELEASE_EXISTS="true"
+          else
+            echo "❌ gh release view failed or release not found"
+            
+            # Method 2: Try GitHub API directly
+            echo "Trying GitHub API..."
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/tags/$RELEASE_TAG")
+            
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "✅ Found release via GitHub API"
+              RELEASE_EXISTS="true"
+            else
+              echo "❌ GitHub API returned $HTTP_STATUS - release not found"
+            fi
+          fi
+          
+          # Set build decision
+          if [ "$RELEASE_EXISTS" = "true" ]; then
             echo "✅ Release $RELEASE_TAG already exists - no build needed"
             echo "should-build=false" >> $GITHUB_OUTPUT
           else
@@ -70,11 +97,17 @@ jobs:
           echo "- **Upstream version**: ${{ steps.version-check.outputs.upstream-version }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Upstream tag**: ${{ steps.version-check.outputs.upstream-tag }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Should build**: ${{ steps.version-check.outputs.should-build }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Repository**: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Checked release tag**: v${{ steps.version-check.outputs.upstream-version }}" >> $GITHUB_STEP_SUMMARY
           
           if [ "${{ steps.version-check.outputs.should-build }}" == "true" ]; then
             echo "- **Action**: 🚀 Proceeding with build and release creation" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Debug**: Release v${{ steps.version-check.outputs.upstream-version }} was not found in this repository." >> $GITHUB_STEP_SUMMARY
           else
             echo "- **Action**: ⏭️ Skipping build - release already exists" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Debug**: Release v${{ steps.version-check.outputs.upstream-version }} already exists in this repository." >> $GITHUB_STEP_SUMMARY
           fi
 
   build-rpm:
