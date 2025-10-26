@@ -49,26 +49,70 @@ jobs:
           # Try multiple methods to check if release exists
           RELEASE_EXISTS="false"
           
-          # Method 1: Try gh release view
+          # Method 1: Try gh release view with detailed diagnostics
           echo "Trying gh release view..."
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+          echo "Repository: ${{ github.repository }}"
+          echo "Token available: ${GITHUB_TOKEN:+YES}"
+          echo "Token length: ${#GITHUB_TOKEN}"
+          
+          # Test gh auth status first
+          echo "Testing gh auth status..."
+          if gh auth status 2>&1; then
+            echo "✅ gh auth status successful"
+          else
+            echo "❌ gh auth status failed"
+          fi
+          
+          # Try to list releases first
+          echo "Testing gh release list..."
+          if gh release list --limit 5 2>&1; then
+            echo "✅ gh release list successful"
+          else
+            echo "❌ gh release list failed"
+          fi
+          
+          # Now try the specific release
+          echo "Testing specific release: $RELEASE_TAG"
+          GH_OUTPUT=$(gh release view "$RELEASE_TAG" 2>&1)
+          GH_EXIT_CODE=$?
+          
+          if [ $GH_EXIT_CODE -eq 0 ]; then
             echo "✅ Found release via gh release view"
             RELEASE_EXISTS="true"
           else
-            echo "❌ gh release view failed or release not found"
-            
+            echo "❌ gh release view failed with exit code: $GH_EXIT_CODE"
+            echo "Error output: $GH_OUTPUT"
             # Method 2: Try GitHub API directly
             echo "Trying GitHub API..."
+            echo "API URL: https://api.github.com/repos/${{ github.repository }}/releases/tags/$RELEASE_TAG"
             HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: Bearer $GITHUB_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${{ github.repository }}/releases/tags/$RELEASE_TAG")
             
+            echo "HTTP Status: $HTTP_STATUS"
             if [ "$HTTP_STATUS" = "200" ]; then
               echo "✅ Found release via GitHub API"
               RELEASE_EXISTS="true"
+              
+              # Additional analysis
+              echo ""
+              echo "🔍 Analysis: gh CLI failed but API succeeded. Possible causes:"
+              echo "  1. gh CLI authentication issue (token scope/format)"
+              echo "  2. gh CLI version compatibility"
+              echo "  3. Network/proxy issues affecting gh CLI"
+              echo "  4. Rate limiting affecting gh CLI differently"
+              echo "  5. Repository context not properly set for gh CLI"
             else
               echo "❌ GitHub API returned $HTTP_STATUS - release not found"
+              
+              if [ "$HTTP_STATUS" = "404" ]; then
+                echo "Release definitely does not exist"
+              elif [ "$HTTP_STATUS" = "401" ]; then
+                echo "Authentication issue - check token permissions"
+              elif [ "$HTTP_STATUS" = "403" ]; then
+                echo "Forbidden - possibly rate limited or insufficient permissions"
+              fi
             fi
           fi
           
