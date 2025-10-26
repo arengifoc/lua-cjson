@@ -1,5 +1,5 @@
 ---
-name: Build lua-cjson RPM
+name: Build lua-cjson Packages
 
 on:
   workflow_dispatch:
