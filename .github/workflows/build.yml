@@ -12,28 +12,13 @@ on:
     - cron: '0 6 * * *'
 
 jobs:
-  check-version:
+  build-and-release:
     runs-on: ubuntu-latest
-    outputs:
-      should-build: ${{ steps.version-check.outputs.should-build }}
-      upstream-version: ${{ steps.version-check.outputs.upstream-version }}
-      upstream-tag: ${{ steps.version-check.outputs.upstream-tag }}
     permissions:
-      contents: read
+      contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Install GitHub CLI
-        run: |
-          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-          sudo apt update
-          sudo apt install gh jq -y
-          
-          # Show gh version for debugging
-          echo "GitHub CLI version:"
-          gh --version
 
       - name: Check version and decide if build is needed
         id: version-check
@@ -46,173 +31,28 @@ jobs:
           UPSTREAM_VERSION=$(echo "$UPSTREAM_TAG" | sed 's/^v//')
           echo "Latest upstream version: $UPSTREAM_VERSION (tag: $UPSTREAM_TAG)"
           
-          # Check if we already have a release for this version
+          # Check if we already have a release for this version using GitHub API
           echo "🔍 Checking if release v$UPSTREAM_VERSION already exists..."
           RELEASE_TAG="v$UPSTREAM_VERSION"
           
-          # Try multiple methods to check if release exists
-          RELEASE_EXISTS="false"
+          echo "Checking via GitHub API: https://api.github.com/repos/${{ github.repository }}/releases/tags/$RELEASE_TAG"
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$RELEASE_TAG")
           
-          # Method 1: Try gh release view with detailed diagnostics
-          echo "Trying gh release view..."
-          echo "Repository: ${{ github.repository }}"
-          echo "Token available: ${GITHUB_TOKEN:+YES}"
-          echo "Token length: ${#GITHUB_TOKEN}"
-          
-          # Test gh auth status first
-          echo "Testing gh auth status..."
-          if gh auth status 2>&1; then
-            echo "✅ gh auth status successful"
-          else
-            echo "❌ gh auth status failed"
-          fi
-          
-          # Try to list releases first
-          echo "Testing gh release list..."
-          echo "All releases in repository (limit 10):"
-          if gh release list --limit 10 2>&1; then
-            echo "✅ gh release list successful"
-            
-            # Try different gh release list options
-            echo ""
-            echo "Testing gh release list with --include-drafts:"
-            gh release list --limit 10 --include-drafts 2>&1 || echo "❌ --include-drafts failed"
-            
-            echo ""
-            echo "Testing gh release list ALL releases (no limit):"
-            ALL_RELEASES=$(gh release list --limit 100 2>&1)
-            echo "$ALL_RELEASES"
-            
-            # Check if our target release appears in the list
-            echo ""
-            echo "Searching for $RELEASE_TAG in release list..."
-            if echo "$ALL_RELEASES" | grep -q "$RELEASE_TAG"; then
-              echo "✅ $RELEASE_TAG found in full release list"
-            else
-              echo "❌ $RELEASE_TAG NOT found in ANY release list"
-              
-              # Try alternative tag formats
-              echo "Trying alternative tag formats:"
-              ALT_TAG1="${UPSTREAM_VERSION}"  # without 'v' prefix
-              ALT_TAG2="v${UPSTREAM_VERSION}" # with 'v' prefix (should be same as RELEASE_TAG)
-              
-              if echo "$ALL_RELEASES" | grep -q "$ALT_TAG1"; then
-                echo "✅ Found with format: $ALT_TAG1"
-              elif echo "$ALL_RELEASES" | grep -q "$ALT_TAG2"; then
-                echo "✅ Found with format: $ALT_TAG2"
-              else
-                echo "❌ Not found with any tag format variations"
-                echo "This suggests a more fundamental issue:"
-                echo "  1. Release was created outside of GitHub's normal flow"
-                echo "  2. gh CLI version compatibility issue"
-                echo "  3. Repository access/permission edge case"
-                echo "  4. GitHub API vs CLI data inconsistency"
-              fi
-            fi
-          else
-            echo "❌ gh release list failed"
-          fi
-          
-          # Now try the specific release
-          echo "Testing specific release: $RELEASE_TAG"
-          GH_OUTPUT=$(gh release view "$RELEASE_TAG" 2>&1)
-          GH_EXIT_CODE=$?
-          
-          if [ $GH_EXIT_CODE -eq 0 ]; then
-            echo "✅ Found release via gh release view"
-            RELEASE_EXISTS="true"
-          else
-            echo "❌ gh release view failed with exit code: $GH_EXIT_CODE"
-            echo "Error output: $GH_OUTPUT"
-            # Method 2: Try GitHub API directly
-            echo "Trying GitHub API..."
-            echo "API URL: https://api.github.com/repos/${{ github.repository }}/releases/tags/$RELEASE_TAG"
-            
-            # Get full release information
-            API_RESPONSE=$(curl -s \
-              -H "Authorization: Bearer $GITHUB_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${{ github.repository }}/releases/tags/$RELEASE_TAG")
-            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-              -H "Authorization: Bearer $GITHUB_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${{ github.repository }}/releases/tags/$RELEASE_TAG")
-            
-            echo "HTTP Status: $HTTP_STATUS"
-            if [ "$HTTP_STATUS" = "200" ]; then
-              echo "✅ Found release via GitHub API"
-              
-              # Extract release details
-              DRAFT=$(echo "$API_RESPONSE" | jq -r '.draft // false')
-              PRERELEASE=$(echo "$API_RESPONSE" | jq -r '.prerelease // false')
-              RELEASE_NAME=$(echo "$API_RESPONSE" | jq -r '.name // "N/A"')
-              CREATED_AT=$(echo "$API_RESPONSE" | jq -r '.created_at // "N/A"')
-              
-              echo "Release details:"
-              echo "  - Name: $RELEASE_NAME"
-              echo "  - Created: $CREATED_AT"
-              echo "  - Draft: $DRAFT"
-              echo "  - Prerelease: $PRERELEASE"
-              
-              if [ "$DRAFT" = "true" ]; then
-                echo "🔍 INSIGHT: Release is a DRAFT - this explains why gh CLI doesn't see it!"
-                echo "   Draft releases are not visible through normal gh release commands"
-              elif [ "$PRERELEASE" = "true" ]; then
-                echo "🔍 INSIGHT: Release is a PRERELEASE - gh CLI might filter these by default"
-              else
-                echo "🔍 INSIGHT: Release is public and published - gh CLI issue is likely:"
-                echo "  1. gh CLI version bug or compatibility issue"
-                echo "  2. Different API endpoints used by gh vs direct API"
-                echo "  3. Caching/timing issue in gh CLI"
-                echo "  4. gh CLI filtering logic excluding this release"
-                
-                echo ""
-                echo "🔍 COMPARING API vs gh CLI data:"
-                echo "API sees: Draft=$DRAFT, Prerelease=$PRERELEASE, Name='$RELEASE_NAME'"
-                
-                # Compare with what gh CLI sees
-                echo "gh CLI release count: $(gh release list --limit 100 | wc -l)"
-                echo "API release count via curl:"
-                API_COUNT=$(curl -s \
-                  -H "Authorization: Bearer $GITHUB_TOKEN" \
-                  -H "Accept: application/vnd.github+json" \
-                  "https://api.github.com/repos/${{ github.repository }}/releases" | jq length)
-                echo "API sees $API_COUNT total releases"
-              fi
-              
-              RELEASE_EXISTS="true"
-              
-              # Additional analysis
-              echo ""
-              echo "🔍 Analysis: gh CLI failed but API succeeded. Possible causes:"
-              echo "  1. gh CLI authentication issue (token scope/format)"
-              echo "  2. gh CLI version compatibility"
-              echo "  3. Network/proxy issues affecting gh CLI"
-              echo "  4. Rate limiting affecting gh CLI differently"
-              echo "  5. Repository context not properly set for gh CLI"
-            else
-              echo "❌ GitHub API returned $HTTP_STATUS - release not found"
-              
-              if [ "$HTTP_STATUS" = "404" ]; then
-                echo "Release definitely does not exist"
-              elif [ "$HTTP_STATUS" = "401" ]; then
-                echo "Authentication issue - check token permissions"
-              elif [ "$HTTP_STATUS" = "403" ]; then
-                echo "Forbidden - possibly rate limited or insufficient permissions"
-              fi
-            fi
-          fi
-          
-          # Set build decision
-          if [ "$RELEASE_EXISTS" = "true" ]; then
+          if [ "$HTTP_STATUS" = "200" ]; then
             echo "✅ Release $RELEASE_TAG already exists - no build needed"
             echo "should-build=false" >> $GITHUB_OUTPUT
-          else
+          elif [ "$HTTP_STATUS" = "404" ]; then
             echo "🚀 Release $RELEASE_TAG does not exist - build needed"
+            echo "should-build=true" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Unexpected HTTP status $HTTP_STATUS - assuming build needed"
             echo "should-build=true" >> $GITHUB_OUTPUT
           fi
           
-          # Set outputs for downstream jobs
+          # Set outputs for later steps
           echo "upstream-version=$UPSTREAM_VERSION" >> $GITHUB_OUTPUT
           echo "upstream-tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
           
@@ -233,147 +73,123 @@ jobs:
           
           if [ "${{ steps.version-check.outputs.should-build }}" == "true" ]; then
             echo "- **Action**: 🚀 Proceeding with build and release creation" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Debug**: Release v${{ steps.version-check.outputs.upstream-version }} was not found in this repository." >> $GITHUB_STEP_SUMMARY
           else
             echo "- **Action**: ⏭️ Skipping build - release already exists" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Debug**: Release v${{ steps.version-check.outputs.upstream-version }} already exists in this repository." >> $GITHUB_STEP_SUMMARY
           fi
 
-  build-rpm:
-    needs: check-version
-    runs-on: ubuntu-24.04
-    if: needs.check-version.outputs.should-build == 'true'
-    container:
-      image: oraclelinux:8
-    outputs:
-      version: ${{ needs.check-version.outputs.upstream-version }}
-      tag: ${{ needs.check-version.outputs.upstream-tag }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        if: steps.version-check.outputs.should-build == 'true'
+        uses: docker/setup-buildx-action@v3
 
-      - name: Install build dependencies
+      - name: Build RPM in Oracle Linux container
+        if: steps.version-check.outputs.should-build == 'true'
         run: |
-          dnf install -y git cmake make gcc gcc-c++ openssl-devel zlib-devel \
-          flex bison oracle-epel-release-el8 rpm-build rpmdevtools
-          dnf install -y luajit luajit-devel
-
-      - name: Clone and checkout lua-cjson version
-        run: |
-          git clone https://github.com/openresty/lua-cjson.git
-          cd lua-cjson
+          # Create a Dockerfile for the build
+          cat > Dockerfile << 'EOF'
+          FROM oraclelinux:8
           
-          # Checkout the specific version determined by the check-version job
-          UPSTREAM_TAG="${{ needs.check-version.outputs.upstream-tag }}"
-          echo "Checking out lua-cjson version: $UPSTREAM_TAG"
-          git checkout "$UPSTREAM_TAG"
-
-      - name: Build lua-cjson
-        run: |
-          cd lua-cjson
-          make LUA_INCLUDE_DIR=/usr/include/luajit-2.1
-          make install
-
-      - name: Prepare RPM build tree
-        run: |
-          mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
-          echo '%_topdir %(echo $HOME)/rpmbuild' > ~/.rpmmacros
-          cp /usr/local/lib/lua/5.1/cjson.so ~/rpmbuild/SOURCES/
+          # Install build dependencies
+          RUN dnf install -y git cmake make gcc gcc-c++ openssl-devel zlib-devel \
+              flex bison oracle-epel-release-el8 rpm-build rpmdevtools && \
+              dnf install -y luajit luajit-devel
           
-          # Generate dynamic changelog entry
-          BUILD_DATE=$(date +'%a %b %d %Y')
-          PACKAGER="GitHub Actions <noreply@github.com>"
-          VERSION="${{ needs.check-version.outputs.upstream-version }}"
-          RELEASE="1%{?dist}"
-          UPSTREAM_TAG="${{ needs.check-version.outputs.upstream-tag }}"
+          WORKDIR /workspace
+          EOF
           
-          # Update spec file with detected version and dynamic changelog
-          sed -e "s/Version:.*/Version:        $VERSION/" \
-              -e "s/__DATE__/$BUILD_DATE/" \
-              -e "s/__PACKAGER__/$PACKAGER/" \
-              -e "s/__VERSION__/$VERSION/g" \
-              -e "s/__RELEASE__/$RELEASE/" \
-              -e "s/__UPSTREAM_TAG__/$UPSTREAM_TAG/" \
-              SPECS/lua-cjson.spec > ~/rpmbuild/SPECS/lua-cjson.spec
+          # Build the container and run the build process
+          docker build -t lua-cjson-builder .
           
-          echo "Generated spec file:"
-          cat ~/rpmbuild/SPECS/lua-cjson.spec
-
-      - name: Build RPM
-        run: |
-          rpmbuild -bb ~/rpmbuild/SPECS/lua-cjson.spec
-
-      - name: List resulting RPMs
-        run: find ~/rpmbuild/RPMS -name '*.rpm' -ls
-
-      - name: Upload RPM artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: lua-cjson-rpm
-          path: ~/rpmbuild/RPMS/**/*.rpm
-          retention-days: 30
-
-  create-release:
-    needs: [check-version, build-rpm]
-    runs-on: ubuntu-latest
-    if: needs.check-version.outputs.should-build == 'true' && needs.build-rpm.result == 'success'
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download RPM artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: lua-cjson-rpm
-          path: ./rpms
-
-      - name: List downloaded files
-        run: ls -la ./rpms/
-
-      - name: Create Release
-        id: create_release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: v${{ needs.check-version.outputs.upstream-version }}
-          name: lua-cjson ${{ needs.check-version.outputs.upstream-version }}
-          body: |
-            ## lua-cjson RPM Package v${{ needs.check-version.outputs.upstream-version }}
-
-            This release includes the precompiled lua-cjson module for Oracle Linux 8 / RHEL 8.
+          # Run the build in the container
+          docker run --rm -v "$PWD":/workspace lua-cjson-builder /bin/bash -c "
+            set -e
             
-            **Source**: [openresty/lua-cjson@${{ needs.check-version.outputs.upstream-tag }}](https://github.com/openresty/lua-cjson/releases/tag/${{ needs.check-version.outputs.upstream-tag }})
+            # Clone and checkout specific version
+            git clone https://github.com/openresty/lua-cjson.git
+            cd lua-cjson
+            git checkout '${{ steps.version-check.outputs.upstream-tag }}'
+            
+            # Build lua-cjson
+            make LUA_INCLUDE_DIR=/usr/include/luajit-2.1
+            make install
+            
+            # Prepare RPM build tree
+            mkdir -p /root/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+            echo '%_topdir %(echo \$HOME)/rpmbuild' > /root/.rpmmacros
+            cp /usr/local/lib/lua/5.1/cjson.so /root/rpmbuild/SOURCES/
+            
+            # Generate dynamic changelog entry
+            BUILD_DATE=\$(date +'%a %b %d %Y')
+            PACKAGER='GitHub Actions <noreply@github.com>'
+            VERSION='${{ steps.version-check.outputs.upstream-version }}'
+            RELEASE='1%{?dist}'
+            UPSTREAM_TAG='${{ steps.version-check.outputs.upstream-tag }}'
+            
+            # Update spec file with detected version and dynamic changelog
+            sed -e \"s/Version:.*/Version:        \$VERSION/\" \
+                -e \"s/__DATE__/\$BUILD_DATE/\" \
+                -e \"s/__PACKAGER__/\$PACKAGER/\" \
+                -e \"s/__VERSION__/\$VERSION/g\" \
+                -e \"s/__RELEASE__/\$RELEASE/\" \
+                -e \"s/__UPSTREAM_TAG__/\$UPSTREAM_TAG/\" \
+                /workspace/SPECS/lua-cjson.spec > /root/rpmbuild/SPECS/lua-cjson.spec
+            
+            echo 'Generated spec file:'
+            cat /root/rpmbuild/SPECS/lua-cjson.spec
+            
+            # Build RPM
+            rpmbuild -bb /root/rpmbuild/SPECS/lua-cjson.spec
+            
+            # Copy RPM to workspace
+            find /root/rpmbuild/RPMS -name '*.rpm' -exec cp {} /workspace/ \;
+            
+            # List resulting RPMs
+            ls -la /workspace/*.rpm
+          "
 
-            ### Installation
-            ```bash
-            # Download the RPM file
-            wget https://github.com/${{ github.repository }}/releases/download/v${{ needs.check-version.outputs.upstream-version }}/lua-cjson-${{ needs.check-version.outputs.upstream-version }}-*.rpm
-
-            # Install with dnf/yum
-            sudo dnf install -y ./lua-cjson-${{ needs.check-version.outputs.upstream-version }}-*.rpm
-            ```
-
-            ### Usage
-            ```lua
-            local cjson = require "cjson"
-            local json_text = cjson.encode({hello = "world"})
-            local lua_table = cjson.decode(json_text)
-            ```
-
-            ### Build Information
-            - **Built on**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
-            - **Source version**: ${{ needs.check-version.outputs.upstream-tag }}
-            - **Architecture**: x86_64
-            - **Target OS**: Oracle Linux 8 / RHEL 8
-          files: ./rpms/**/*.rpm
-          draft: false
-          prerelease: false
+      - name: Create Release using GitHub API
+        if: steps.version-check.outputs.should-build == 'true'
+        run: |
+          VERSION="${{ steps.version-check.outputs.upstream-version }}"
+          TAG="v$VERSION"
+          UPSTREAM_TAG="${{ steps.version-check.outputs.upstream-tag }}"
+          BUILD_DATE=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          
+          # Create release using GitHub API
+          echo "Creating release $TAG..."
+          RELEASE_BODY=$(cat << EOF
+          {
+            "tag_name": "$TAG",
+            "name": "lua-cjson $VERSION",
+            "body": "## lua-cjson RPM Package v$VERSION\n\nThis release includes the precompiled lua-cjson module for Oracle Linux 8 / RHEL 8.\n\n**Source**: [openresty/lua-cjson@$UPSTREAM_TAG](https://github.com/openresty/lua-cjson/releases/tag/$UPSTREAM_TAG)\n\n### Installation\n\`\`\`bash\n# Download the RPM file\nwget https://github.com/${{ github.repository }}/releases/download/$TAG/lua-cjson-$VERSION-*.rpm\n\n# Install with dnf/yum\nsudo dnf install -y ./lua-cjson-$VERSION-*.rpm\n\`\`\`\n\n### Usage\n\`\`\`lua\nlocal cjson = require \"cjson\"\nlocal json_text = cjson.encode({hello = \"world\"})\nlocal lua_table = cjson.decode(json_text)\n\`\`\`\n\n### Build Information\n- **Built on**: $BUILD_DATE\n- **Source version**: $UPSTREAM_TAG\n- **Architecture**: x86_64\n- **Target OS**: Oracle Linux 8 / RHEL 8",
+            "draft": false,
+            "prerelease": false
+          }
+          EOF
+          )
+          
+          RELEASE_RESPONSE=$(curl -s \
+            -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases" \
+            -d "$RELEASE_BODY")
+          
+          UPLOAD_URL=$(echo "$RELEASE_RESPONSE" | jq -r '.upload_url' | sed 's/{?name,label}//')
+          echo "Upload URL: $UPLOAD_URL"
+          
+          # Upload RPM file
+          RPM_FILE=$(find . -maxdepth 1 -name "*.rpm" -type f | head -1)
+          RPM_NAME=$(basename "$RPM_FILE")
+          
+          echo "Uploading $RPM_NAME..."
+          curl -s \
+            -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/x-rpm" \
+            --data-binary "@$RPM_FILE" \
+            "$UPLOAD_URL?name=$RPM_NAME"
+          
+          echo "✅ Successfully created release $TAG with RPM asset"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Release creation result
-        run: |
-          echo "✅ Successfully created release for version ${{ needs.check-version.outputs.upstream-version }}"
