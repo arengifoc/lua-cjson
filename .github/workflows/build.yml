@@ -1,0 +1,178 @@
+---
+name: Build lua-cjson RPM
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+  schedule:
+    # Check for new versions daily at 6 AM UTC
+    - cron: '0 6 * * *'
+
+jobs:
+  build-rpm:
+    runs-on: ubuntu-24.04
+    container:
+      image: oraclelinux:8
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          dnf install -y git cmake make gcc gcc-c++ openssl-devel zlib-devel \
+          flex bison oracle-epel-release-el8 rpm-build rpmdevtools
+          dnf install -y luajit luajit-devel
+
+      - name: Clone and detect lua-cjson version
+        id: version
+        run: |
+          git clone https://github.com/openresty/lua-cjson.git
+          cd lua-cjson
+          
+          # Get the latest tag from the original repository
+          LATEST_TAG=$(git describe --tags --abbrev=0)
+          echo "Latest tag: $LATEST_TAG"
+          
+          # Extract version number (remove 'v' prefix if present)
+          VERSION=$(echo "$LATEST_TAG" | sed 's/^v//')
+          echo "Version: $VERSION"
+          
+          # Set outputs for other jobs
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          
+          # Checkout the latest tagged version
+          git checkout "$LATEST_TAG"
+
+      - name: Build lua-cjson
+        run: |
+          cd lua-cjson
+          make LUA_INCLUDE_DIR=/usr/include/luajit-2.1
+          make install
+
+      - name: Prepare RPM build tree
+        run: |
+          mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          echo '%_topdir %(echo $HOME)/rpmbuild' > ~/.rpmmacros
+          cp /usr/local/lib/lua/5.1/cjson.so ~/rpmbuild/SOURCES/
+          
+          # Update spec file with detected version
+          sed "s/Version:.*/Version:        ${{ steps.version.outputs.version }}/" SPECS/lua-cjson.spec > ~/rpmbuild/SPECS/lua-cjson.spec
+          
+          echo "Generated spec file:"
+          cat ~/rpmbuild/SPECS/lua-cjson.spec
+
+      - name: Build RPM
+        run: |
+          rpmbuild -bb ~/rpmbuild/SPECS/lua-cjson.spec
+
+      - name: List resulting RPMs
+        run: find ~/rpmbuild/RPMS -name '*.rpm' -ls
+
+      - name: Upload RPM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lua-cjson-rpm
+          path: ~/rpmbuild/RPMS/**/*.rpm
+          retention-days: 30
+
+  create-release:
+    needs: build-rpm
+    runs-on: ubuntu-latest
+    if: always() && needs.build-rpm.result == 'success'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install GitHub CLI
+        run: |
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt update
+          sudo apt install gh -y
+
+      - name: Check if release already exists
+        id: check_release
+        run: |
+          VERSION="${{ needs.build-rpm.outputs.version }}"
+          TAG="v$VERSION"
+          
+          # Check if release already exists
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Release $TAG does not exist"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download RPM artifacts
+        if: steps.check_release.outputs.exists == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: lua-cjson-rpm
+          path: ./rpms
+
+      - name: List downloaded files
+        if: steps.check_release.outputs.exists == 'false'
+        run: ls -la ./rpms/
+
+      - name: Create Release
+        if: steps.check_release.outputs.exists == 'false'
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.check_release.outputs.tag }}
+          name: lua-cjson ${{ needs.build-rpm.outputs.version }}
+          body: |
+            ## lua-cjson RPM Package v${{ needs.build-rpm.outputs.version }}
+
+            This release includes the precompiled lua-cjson module for Oracle Linux 8 / RHEL 8.
+            
+            **Source**: [openresty/lua-cjson@${{ needs.build-rpm.outputs.tag }}](https://github.com/openresty/lua-cjson/releases/tag/${{ needs.build-rpm.outputs.tag }})
+
+            ### Installation
+            ```bash
+            # Download the RPM file
+            wget https://github.com/${{ github.repository }}/releases/download/${{ steps.check_release.outputs.tag }}/lua-cjson-${{ needs.build-rpm.outputs.version }}-*.rpm
+
+            # Install with dnf/yum
+            sudo dnf install -y ./lua-cjson-${{ needs.build-rpm.outputs.version }}-*.rpm
+            ```
+
+            ### Usage
+            ```lua
+            local cjson = require "cjson"
+            local json_text = cjson.encode({hello = "world"})
+            local lua_table = cjson.decode(json_text)
+            ```
+
+            ### Build Information
+            - **Built on**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+            - **Source version**: ${{ needs.build-rpm.outputs.tag }}
+            - **Architecture**: x86_64
+            - **Target OS**: Oracle Linux 8 / RHEL 8
+          files: ./rpms/**/*.rpm
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Release creation result
+        run: |
+          if [ "${{ steps.check_release.outputs.exists }}" == "true" ]; then
+            echo "ℹ️ Release already exists for version ${{ needs.build-rpm.outputs.version }}"
+          else
+            echo "✅ Created new release for version ${{ needs.build-rpm.outputs.version }}"
+          fi
