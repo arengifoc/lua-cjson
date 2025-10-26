@@ -12,13 +12,80 @@ on:
     - cron: '0 6 * * *'
 
 jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      should-build: ${{ steps.version-check.outputs.should-build }}
+      upstream-version: ${{ steps.version-check.outputs.upstream-version }}
+      upstream-tag: ${{ steps.version-check.outputs.upstream-tag }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install GitHub CLI
+        run: |
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt update
+          sudo apt install gh -y
+
+      - name: Check version and decide if build is needed
+        id: version-check
+        run: |
+          # Get latest version from upstream lua-cjson
+          echo "🔍 Checking latest lua-cjson version..."
+          git clone --depth 1 https://github.com/openresty/lua-cjson.git temp-cjson
+          cd temp-cjson
+          UPSTREAM_TAG=$(git describe --tags --abbrev=0)
+          UPSTREAM_VERSION=$(echo "$UPSTREAM_TAG" | sed 's/^v//')
+          echo "Latest upstream version: $UPSTREAM_VERSION (tag: $UPSTREAM_TAG)"
+          
+          # Check if we already have a release for this version
+          echo "🔍 Checking if release v$UPSTREAM_VERSION already exists..."
+          RELEASE_TAG="v$UPSTREAM_VERSION"
+          
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "✅ Release $RELEASE_TAG already exists - no build needed"
+            echo "should-build=false" >> $GITHUB_OUTPUT
+          else
+            echo "🚀 Release $RELEASE_TAG does not exist - build needed"
+            echo "should-build=true" >> $GITHUB_OUTPUT
+          fi
+          
+          # Set outputs for downstream jobs
+          echo "upstream-version=$UPSTREAM_VERSION" >> $GITHUB_OUTPUT
+          echo "upstream-tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
+          
+          # Clean up
+          cd ..
+          rm -rf temp-cjson
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build decision summary
+        run: |
+          echo "## 📋 Build Decision Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Upstream version**: ${{ steps.version-check.outputs.upstream-version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Upstream tag**: ${{ steps.version-check.outputs.upstream-tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Should build**: ${{ steps.version-check.outputs.should-build }}" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.version-check.outputs.should-build }}" == "true" ]; then
+            echo "- **Action**: 🚀 Proceeding with build and release creation" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Action**: ⏭️ Skipping build - release already exists" >> $GITHUB_STEP_SUMMARY
+          fi
+
   build-rpm:
+    needs: check-version
     runs-on: ubuntu-24.04
+    if: needs.check-version.outputs.should-build == 'true'
     container:
       image: oraclelinux:8
     outputs:
-      version: ${{ steps.version.outputs.version }}
-      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ needs.check-version.outputs.upstream-version }}
+      tag: ${{ needs.check-version.outputs.upstream-tag }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -29,26 +96,15 @@ jobs:
           flex bison oracle-epel-release-el8 rpm-build rpmdevtools
           dnf install -y luajit luajit-devel
 
-      - name: Clone and detect lua-cjson version
-        id: version
+      - name: Clone and checkout lua-cjson version
         run: |
           git clone https://github.com/openresty/lua-cjson.git
           cd lua-cjson
           
-          # Get the latest tag from the original repository
-          LATEST_TAG=$(git describe --tags --abbrev=0)
-          echo "Latest tag: $LATEST_TAG"
-          
-          # Extract version number (remove 'v' prefix if present)
-          VERSION=$(echo "$LATEST_TAG" | sed 's/^v//')
-          echo "Version: $VERSION"
-          
-          # Set outputs for other jobs
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
-          
-          # Checkout the latest tagged version
-          git checkout "$LATEST_TAG"
+          # Checkout the specific version determined by the check-version job
+          UPSTREAM_TAG="${{ needs.check-version.outputs.upstream-tag }}"
+          echo "Checking out lua-cjson version: $UPSTREAM_TAG"
+          git checkout "$UPSTREAM_TAG"
 
       - name: Build lua-cjson
         run: |
@@ -65,9 +121,9 @@ jobs:
           # Generate dynamic changelog entry
           BUILD_DATE=$(date +'%a %b %d %Y')
           PACKAGER="GitHub Actions <noreply@github.com>"
-          VERSION="${{ steps.version.outputs.version }}"
+          VERSION="${{ needs.check-version.outputs.upstream-version }}"
           RELEASE="1%{?dist}"
-          UPSTREAM_TAG="${{ steps.version.outputs.tag }}"
+          UPSTREAM_TAG="${{ needs.check-version.outputs.upstream-tag }}"
           
           # Update spec file with detected version and dynamic changelog
           sed -e "s/Version:.*/Version:        $VERSION/" \
@@ -96,73 +152,44 @@ jobs:
           retention-days: 30
 
   create-release:
-    needs: build-rpm
+    needs: [check-version, build-rpm]
     runs-on: ubuntu-latest
-    if: always() && needs.build-rpm.result == 'success'
+    if: needs.check-version.outputs.should-build == 'true' && needs.build-rpm.result == 'success'
     permissions:
       contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install GitHub CLI
-        run: |
-          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-          sudo apt update
-          sudo apt install gh -y
-
-      - name: Check if release already exists
-        id: check_release
-        run: |
-          VERSION="${{ needs.build-rpm.outputs.version }}"
-          TAG="v$VERSION"
-          
-          # Check if release already exists
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists"
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "Release $TAG does not exist"
-            echo "exists=false" >> $GITHUB_OUTPUT
-          fi
-          
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Download RPM artifacts
-        if: steps.check_release.outputs.exists == 'false'
         uses: actions/download-artifact@v4
         with:
           name: lua-cjson-rpm
           path: ./rpms
 
       - name: List downloaded files
-        if: steps.check_release.outputs.exists == 'false'
         run: ls -la ./rpms/
 
       - name: Create Release
-        if: steps.check_release.outputs.exists == 'false'
         id: create_release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ steps.check_release.outputs.tag }}
-          name: lua-cjson ${{ needs.build-rpm.outputs.version }}
+          tag_name: v${{ needs.check-version.outputs.upstream-version }}
+          name: lua-cjson ${{ needs.check-version.outputs.upstream-version }}
           body: |
-            ## lua-cjson RPM Package v${{ needs.build-rpm.outputs.version }}
+            ## lua-cjson RPM Package v${{ needs.check-version.outputs.upstream-version }}
 
             This release includes the precompiled lua-cjson module for Oracle Linux 8 / RHEL 8.
             
-            **Source**: [openresty/lua-cjson@${{ needs.build-rpm.outputs.tag }}](https://github.com/openresty/lua-cjson/releases/tag/${{ needs.build-rpm.outputs.tag }})
+            **Source**: [openresty/lua-cjson@${{ needs.check-version.outputs.upstream-tag }}](https://github.com/openresty/lua-cjson/releases/tag/${{ needs.check-version.outputs.upstream-tag }})
 
             ### Installation
             ```bash
             # Download the RPM file
-            wget https://github.com/${{ github.repository }}/releases/download/${{ steps.check_release.outputs.tag }}/lua-cjson-${{ needs.build-rpm.outputs.version }}-*.rpm
+            wget https://github.com/${{ github.repository }}/releases/download/v${{ needs.check-version.outputs.upstream-version }}/lua-cjson-${{ needs.check-version.outputs.upstream-version }}-*.rpm
 
             # Install with dnf/yum
-            sudo dnf install -y ./lua-cjson-${{ needs.build-rpm.outputs.version }}-*.rpm
+            sudo dnf install -y ./lua-cjson-${{ needs.check-version.outputs.upstream-version }}-*.rpm
             ```
 
             ### Usage
@@ -174,7 +201,7 @@ jobs:
 
             ### Build Information
             - **Built on**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
-            - **Source version**: ${{ needs.build-rpm.outputs.tag }}
+            - **Source version**: ${{ needs.check-version.outputs.upstream-tag }}
             - **Architecture**: x86_64
             - **Target OS**: Oracle Linux 8 / RHEL 8
           files: ./rpms/**/*.rpm
@@ -185,8 +212,4 @@ jobs:
 
       - name: Release creation result
         run: |
-          if [ "${{ steps.check_release.outputs.exists }}" == "true" ]; then
-            echo "ℹ️ Release already exists for version ${{ needs.build-rpm.outputs.version }}"
-          else
-            echo "✅ Created new release for version ${{ needs.build-rpm.outputs.version }}"
-          fi
+          echo "✅ Successfully created release for version ${{ needs.check-version.outputs.upstream-version }}"
