@@ -4,7 +4,7 @@ name: Build lua-cjson RPM
 on:
   workflow_dispatch:
   push:
-    branches: [develop, main]
+    branches: [main]
     tags:
       - 'v*'
   schedule:
