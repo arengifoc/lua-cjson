@@ -27,8 +27,27 @@ jobs:
           echo "🔍 Checking latest lua-cjson version..."
           git clone --depth 1 https://github.com/openresty/lua-cjson.git temp-cjson
           cd temp-cjson
-          UPSTREAM_TAG=$(git describe --tags --abbrev=0)
-          UPSTREAM_VERSION=$(echo "$UPSTREAM_TAG" | sed 's/^v//')
+          
+          # Try to get the latest tag, with fallback methods
+          if UPSTREAM_TAG=$(git describe --tags --abbrev=0 2>/dev/null); then
+            echo "Found tag: $UPSTREAM_TAG"
+            UPSTREAM_VERSION=$(echo "$UPSTREAM_TAG" | sed 's/^v//')
+          else
+            echo "No tags found, checking for releases via GitHub API..."
+            # Fallback: Get latest release from GitHub API
+            RELEASE_INFO=$(curl -s "https://api.github.com/repos/openresty/lua-cjson/releases/latest")
+            if echo "$RELEASE_INFO" | grep -q '"tag_name"'; then
+              UPSTREAM_TAG=$(echo "$RELEASE_INFO" | grep '"tag_name":' | head -n1 | cut -d'"' -f4)
+              UPSTREAM_VERSION=$(echo "$UPSTREAM_TAG" | sed 's/^v//')
+              echo "Found release tag from API: $UPSTREAM_TAG"
+            else
+              echo "No releases found, using commit SHA as version..."
+              UPSTREAM_TAG=$(git rev-parse --short HEAD)
+              UPSTREAM_VERSION="0.0.0-git-$UPSTREAM_TAG"
+              echo "Using commit-based version: $UPSTREAM_VERSION"
+            fi
+          fi
+          
           echo "Latest upstream version: $UPSTREAM_VERSION (tag: $UPSTREAM_TAG)"
           
           # Check if we already have a release for this version using GitHub API
@@ -106,7 +125,18 @@ jobs:
             # Clone and checkout specific version
             git clone https://github.com/openresty/lua-cjson.git
             cd lua-cjson
-            git checkout '${{ steps.version-check.outputs.upstream-tag }}'
+            
+            # Checkout the specific tag/commit
+            if git tag -l | grep -q '^${{ steps.version-check.outputs.upstream-tag }}$'; then
+              echo 'Checking out tag: ${{ steps.version-check.outputs.upstream-tag }}'
+              git checkout '${{ steps.version-check.outputs.upstream-tag }}'
+            elif git show '${{ steps.version-check.outputs.upstream-tag }}' >/dev/null 2>&1; then
+              echo 'Checking out commit: ${{ steps.version-check.outputs.upstream-tag }}'
+              git checkout '${{ steps.version-check.outputs.upstream-tag }}'
+            else
+              echo 'Tag/commit not found, using latest main/master branch'
+              git checkout \$(git symbolic-ref refs/remotes/origin/HEAD | sed 's@^refs/remotes/origin/@@')
+            fi
             
             # Build lua-cjson
             make LUA_INCLUDE_DIR=/usr/include/luajit-2.1
